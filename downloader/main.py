@@ -419,10 +419,13 @@ class PodcastPipeline:
         # Initialize transcriber if not already done
         if self.transcriber is None:
             from transcriber import ParakeetTranscriber
+            tcfg = self.config.get('transcription', {})
             self.transcriber = ParakeetTranscriber(
-                model_name=self.config['transcription']['model_name'],
-                batch_size=batch_size or self.config['transcription']['batch_size'],
-                gpu_ids=use_gpu_ids or list(range(self.config['transcription']['num_gpus']))
+                model_name=tcfg.get('model_name', 'nvidia/parakeet-tdt-0.6b-v2'),
+                batch_size=batch_size or tcfg.get('batch_size', 8),
+                gpu_ids=use_gpu_ids or list(range(tcfg.get('num_gpus', 1))),
+                chunk_duration_seconds=tcfg.get('chunk_duration_seconds', 1200),
+                overlap_seconds=tcfg.get('overlap_seconds', 30)
             )
         
         # Get episodes that need transcription

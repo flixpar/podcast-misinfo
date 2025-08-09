@@ -9,7 +9,7 @@ import time
 import torch
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing as mp
 from queue import Queue
@@ -35,7 +35,10 @@ class ParakeetTranscriber:
     """
     
     def __init__(self, model_name: str = "nvidia/parakeet-tdt-0.6b-v2",
-                 batch_size: int = 8, gpu_ids: Optional[List[int]] = None):
+                 batch_size: int = 8,
+                 gpu_ids: Optional[List[int]] = None,
+                 chunk_duration_seconds: int = 1200,
+                 overlap_seconds: int = 30):
         """
         Initialize the Parakeet transcriber
         
@@ -54,7 +57,9 @@ class ParakeetTranscriber:
         
         # Audio processing parameters
         self.sample_rate = 16000  # Parakeet expects 16kHz
-        self.max_duration = 1440  # 24 minutes in seconds
+        self.max_duration = int(chunk_duration_seconds)
+        self.chunk_duration = int(chunk_duration_seconds)
+        self.overlap_duration = int(overlap_seconds)
         
         # Initialize models on GPUs
         self._initialize_models()
@@ -84,7 +89,7 @@ class ParakeetTranscriber:
                 logger.info(f"Successfully loaded model on GPU {gpu_id}")
                 
             except Exception as e:
-                logger.error(f"Failed to load model on GPU {gpu_id}: {str(e)}")
+                logger.exception(f"Failed to load model on GPU {gpu_id}: {str(e)}")
                 raise
         
         self.model_loaded = True
@@ -139,7 +144,7 @@ class ParakeetTranscriber:
                 })
                 
             except Exception as e:
-                logger.error(f"Failed to prepare audio {audio_path}: {str(e)}")
+                logger.exception(f"Failed to prepare audio {audio_path}: {str(e)}")
                 continue
         
         return prepared
@@ -206,7 +211,7 @@ class ParakeetTranscriber:
             }
             
         except Exception as e:
-            logger.error(f"Audio preprocessing failed: {str(e)}")
+            logger.exception(f"Audio preprocessing failed: {str(e)}")
             
             # Try alternative method with pydub
             try:
@@ -225,7 +230,7 @@ class ParakeetTranscriber:
                 }
                 
             except Exception as e2:
-                logger.error(f"Alternative preprocessing also failed: {str(e2)}")
+                logger.exception(f"Alternative preprocessing also failed: {str(e2)}")
                 raise
     
     def _parallel_transcribe(self, prepared_batch: List[Dict]) -> List[Dict]:
@@ -254,7 +259,7 @@ class ParakeetTranscriber:
                     gpu_results = future.result(timeout=3600)  # 1 hour timeout
                     results.extend(gpu_results)
                 except Exception as e:
-                    logger.error(f"GPU transcription failed: {str(e)}")
+                    logger.exception(f"GPU transcription failed: {str(e)}")
         
         return results
     
@@ -310,17 +315,22 @@ class ParakeetTranscriber:
                 else:
                     result = self._transcribe_single(model, item)
                 
-                # Add timing information
+                # Add timing information (guard against zero/None duration)
                 result['transcription_time'] = time.time() - start_time
-                result['rtf'] = result['transcription_time'] / item['duration']
+                duration_seconds = item.get('duration') or 0
+                result['rtf'] = (
+                    result['transcription_time'] / duration_seconds
+                    if duration_seconds > 0 else None
+                )
                 
                 results.append(result)
                 
-                logger.info(f"Transcribed '{item['title']}' on GPU {gpu_id} "
-                          f"(RTF: {result['rtf']:.2f})")
+                rtf_value = result.get('rtf')
+                rtf_str = f"{rtf_value:.2f}" if isinstance(rtf_value, (int, float)) and rtf_value is not None else "n/a"
+                logger.info(f"Transcribed '{item['title']}' on GPU {gpu_id} (RTF: {rtf_str})")
                 
             except Exception as e:
-                logger.error(f"Failed to transcribe {item['title']}: {str(e)}")
+                logger.exception(f"Failed to transcribe {item['title']}: {str(e)}")
                 results.append({
                     'episode_id': item['episode_id'],
                     'success': False,
@@ -341,18 +351,8 @@ class ParakeetTranscriber:
                 num_workers=0  # Avoid multiprocessing issues
             )
             
-            # Extract transcript and metadata
-            if isinstance(result, list) and len(result) > 0:
-                if isinstance(result[0], tuple):
-                    # Handle (text, metadata) tuple format
-                    transcript_text = result[0][0]
-                    metadata = result[0][1] if len(result[0]) > 1 else {}
-                else:
-                    transcript_text = result[0]
-                    metadata = {}
-            else:
-                transcript_text = str(result)
-                metadata = {}
+            # Normalize output to text + metadata
+            transcript_text, metadata = self._normalize_transcription_output(result)
             
             # Get word-level timestamps if available
             timestamps = self._extract_timestamps(model, item['processed_path'])
@@ -382,8 +382,89 @@ class ParakeetTranscriber:
             }
             
         except Exception as e:
-            logger.error(f"Transcription failed: {str(e)}")
+            logger.exception(f"Transcription failed: {str(e)}")
             raise
+
+    def _normalize_transcription_output(self, result: Any) -> Tuple[str, Dict[str, Any]]:
+        """
+        Normalize various possible NeMo transcription outputs into (text, metadata).
+
+        Handles:
+        - list[str]
+        - list[Hypothesis] (objects with .text/.words/.confidence)
+        - list[tuple]
+        - plain str
+        - dict with 'text'
+        - anything else -> str(result)
+        """
+        text: str = ""
+        metadata: Dict[str, Any] = {}
+
+        try:
+            # Common case: list with a single item
+            if isinstance(result, list) and len(result) > 0:
+                first = result[0]
+
+                # Tuple format: (text, metadata)
+                if isinstance(first, tuple) and len(first) > 0:
+                    text = first[0] if isinstance(first[0], str) else str(first[0])
+                    if len(first) > 1 and isinstance(first[1], dict):
+                        metadata = first[1]
+                    return text, metadata
+
+                # Hypothesis-like object: has .text attribute
+                if hasattr(first, 'text'):
+                    text = getattr(first, 'text', '') or ''
+                    # Optionally capture confidence/words if present
+                    conf = getattr(first, 'confidence', None)
+                    if conf is not None:
+                        metadata['confidence'] = conf
+                    words = getattr(first, 'words', None)
+                    if words is not None:
+                        metadata['words'] = words
+                    return text, metadata
+
+                # Dict with 'text' key
+                if isinstance(first, dict) and 'text' in first:
+                    text = first.get('text') or ''
+                    # Merge any remaining fields as metadata
+                    md = {k: v for k, v in first.items() if k != 'text'}
+                    if md:
+                        metadata.update(md)
+                    return text, metadata
+
+                # Plain string
+                if isinstance(first, str):
+                    return first, metadata
+
+                # Fallback
+                return str(first), metadata
+
+            # Not a list, handle direct values
+            if isinstance(result, str):
+                return result, metadata
+            if isinstance(result, dict) and 'text' in result:
+                text = result.get('text') or ''
+                md = {k: v for k, v in result.items() if k != 'text'}
+                if md:
+                    metadata.update(md)
+                return text, metadata
+            # Non-list Hypothesis-like object
+            if hasattr(result, 'text'):
+                text = getattr(result, 'text', '') or ''
+                conf = getattr(result, 'confidence', None)
+                if conf is not None:
+                    metadata['confidence'] = conf
+                words = getattr(result, 'words', None)
+                if words is not None:
+                    metadata['words'] = words
+                return text, metadata
+
+            # Fallback to string conversion
+            return str(result), metadata
+        except Exception:
+            # Last-resort fallback
+            return str(result), metadata
     
     def _transcribe_long_audio(self, model, item: Dict) -> Dict:
         """
@@ -401,12 +482,9 @@ class ParakeetTranscriber:
         # Load audio
         audio, sr = librosa.load(item['processed_path'], sr=None)
         
-        # Calculate chunk size (20 minutes with 30s overlap)
-        chunk_duration = 1200  # 20 minutes
-        overlap_duration = 30  # 30 seconds overlap
-        
-        chunk_samples = int(chunk_duration * sr)
-        overlap_samples = int(overlap_duration * sr)
+        # Calculate chunk size based on configured values
+        chunk_samples = int(self.chunk_duration * sr)
+        overlap_samples = int(self.overlap_duration * sr)
         
         # Create chunks
         chunks = []
@@ -445,14 +523,30 @@ class ParakeetTranscriber:
             )
             
             if result:
-                text = result[0] if isinstance(result, list) else str(result)
+                chunk_text, _ = self._normalize_transcription_output(result)
+                text = chunk_text if isinstance(chunk_text, str) else str(chunk_text)
                 full_text.append(text)
                 
                 # Adjust timestamps for chunk offset
                 segments = self._format_segments(text, None)
                 for segment in segments:
-                    segment['start'] += chunk['start_time']
-                    segment['end'] += chunk['start_time']
+                    # Normalize and offset start time
+                    if segment.get('start') is not None:
+                        try:
+                            segment['start'] = float(segment['start']) + float(chunk['start_time'])
+                        except Exception:
+                            segment['start'] = float(chunk['start_time'])
+                    else:
+                        segment['start'] = float(chunk['start_time'])
+
+                    # Normalize and offset end time
+                    if segment.get('end') is not None:
+                        try:
+                            segment['end'] = float(segment['end']) + float(chunk['start_time'])
+                        except Exception:
+                            segment['end'] = float(chunk['end_time'])
+                    else:
+                        segment['end'] = float(chunk['end_time'])
                 
                 all_segments.extend(segments)
         
@@ -524,6 +618,10 @@ class ParakeetTranscriber:
         Returns:
             List of segment dictionaries
         """
+        # Ensure text is a string
+        if not isinstance(text, str):
+            text = getattr(text, 'text', str(text))
+
         segments = []
         
         if timestamps:
